@@ -1,3 +1,25 @@
+---
+license: mit
+language:
+- en
+library_name: transformers
+pipeline_tag: text-generation
+tags:
+- llama
+- text-generation
+- multimodal
+- any-to-any
+- image-to-text
+- text-to-image
+- from-scratch
+- 2b
+- fsdp
+- aimytog
+datasets:
+- HuggingFaceFW/fineweb
+- HuggingFaceFW/fineweb-edu
+---
+
 # MNAI Nyx 0.5
 
 **AIMYTOG: AI Model You'll Train On GPU.**
@@ -106,6 +128,8 @@ python scaling.py --steps 300 --out scaling-report.json
 
 A clean result is a loss that falls smoothly with size, a fitted power law with a small residual, and a predicted loss at full scale that is sane, not exploding. The default run (300 steps, LR 1e-3) gives proxy losses 2.32, 2.26, 2.26 and predicts a loss of about 2.17 at 2.1B. That is the evidence a shape can converge. It is not a guarantee. Only the full run is.
 
+Read the numbers honestly, because the flattening is real: the three proxies come in at 2.32, 2.26, 2.26. The 20M proxy barely beats the 5M one. That is what tiny proxies on a tiny corpus do — at 300 steps the bigger proxy is undertrained, so the fit is an extrapolation, not a measurement. What is proven: the shape converges at small scale, the power law fits with a small residual, and the predicted loss at 2.1B is sane. What is NOT proven: a full 2.1B run. Nobody has run one yet — that is the point of AIMYTOG, you run it. Gradient instabilities, MoE routing collapse, and multimodal alignment across text, vision, and audio are exactly the things a full run would shake out. Before you start one, run `validate_cluster.py` on the cluster: it checks distributed init, all-reduce, FSDP sharding, MoE router balance, and multimodal outputs on a tiny model first. And `train.py` guards the run itself: gradient clipping, a loss spike guard that drops bad steps and reloads the last checkpoint, and for MoE a load-balancing aux loss, a router z-loss, and a per-expert capacity factor.
+
 ## Hardware
 
 A 2B model fits on one GPU. That is the whole point of 0.5.
@@ -128,6 +152,50 @@ A full Chinchilla-optimal run is about 40B tokens, about 38,147 optimizer steps 
 | 1x RTX 4090 (24GB) | ~4-8 weeks |
 | 1x H100 80GB | ~2-4 weeks |
 | 8x H100 80GB | under a week |
+
+## Parallelism
+
+train.py shards the model with PyTorch FSDP by default. At 2B that is all you will ever need: the model fits on one GPU, and FSDP over 8 GPUs is already more than enough. The 3D parallel code below exists because the family shares one training script — Nyx 1 and 1.2 need it past 256 GPUs, where pure FSDP all-reduces the full gradient set across nodes every step and the inter-node network becomes the wall. For 0.5, it is overkill, and the plan command will tell you so.
+
+parallel.py builds the 3D mesh: tensor parallel inside a node (8 GPUs, where NVLink is fast), pipeline parallel across layers, data parallel for the rest, with FSDP only inside the data parallel group. MoE experts get expert parallel on top.
+
+```bash
+# what should I use for N GPUs? prints the plan and the warning
+python train.py --parallel-plan 256
+python parallel.py --plan 256 --moe-experts 8
+
+# train with 3D parallel instead of pure FSDP
+torchrun --nproc_per_node=8 --nnodes=32 --node_rank=0 \
+  --master_addr=<master> --master_port=29500 \
+  train.py --parallel-strategy 3d
+```
+
+The plan command is the honest one: below 256 GPUs it tells you to stay on FSDP, because 3D parallel is extra machinery you do not need. Above it, it warns you and switches.
+
+
+## Post-training
+
+Pre-training teaches the model to autocomplete the internet. It does not teach it to answer a question, follow an instruction, or write code on request. A raw pre-trained checkpoint is not a chat assistant, and this repo does not pretend otherwise. Post-training is two steps, both included:
+
+1. SFT — supervised fine-tuning on instruction/response pairs. The loss is only on the response tokens, so the model learns to produce the answer, not to predict the question. `sft.py` takes a pre-trained checkpoint and a JSONL of pairs, and it ships with a small built-in sample set so the smoke test runs offline.
+
+```bash
+# 3 steps on CPU, proves the masking and the optimizer step work
+python sft.py --smoke
+
+# from a pre-trained checkpoint
+python sft.py --model out-nyx05/ckpt-5000 --data ./sft.jsonl --out out-sft --epochs 3 --lr 2e-5
+```
+
+2. DPO — Direct Preference Optimization on chosen/rejected pairs. It pushes the model to prefer the better reply, with a frozen reference model anchoring it so it cannot drift away from the SFT model to game the pairs. No reward model, no PPO loop. GRPO is the follow-up if you want on-policy RL later.
+
+```bash
+python dpo.py --smoke
+python dpo.py --model out-sft --data ./dpo.jsonl --out out-dpo --epochs 1 --lr 5e-7
+```
+
+The pipeline is: pretrain -> SFT -> DPO (-> GRPO). Skip SFT and DPO gives you a model that autocompletes; skip DPO and you get a model that answers but has never been told which answer is better.
+
 
 ## Quick start
 
@@ -235,7 +303,7 @@ That is it. Train it, and the model that comes out is MyCoolModel, trained by yo
 |---|---|
 | `model.py` | The 2B architecture (MNAI Nyx 0.5), param count, FLOPs, init, surgery helpers, MoE layers |
 | `multimodal.py` | Any-to-any modules: ViT vision encoder, DiT image decoder, audio encoder/decoder |
-| `train.py` | Single-GPU training (FSDP2 for a small cluster), schedulers, optimizers, WandB, eval, full checkpoints, loss spike guard, MoE training |
+| `train.py` | Single-GPU training (FSDP2 for a small cluster, 3D parallel option), schedulers, optimizers, WandB, eval, full checkpoints, loss spike guard, MoE training with aux + z-loss |
 | `data.py` | Data loading, filtering, dedup, tokenization, dataset mixing, domain-balanced mix |
 | `scaling.py` | Scaling-law check: tiny proxy runs, power-law fit, predicted loss at 2.1B |
 | `quantize.py` | Checkpoint to GGUF: Q4_K_M and Q8_0 via llama.cpp |
@@ -247,10 +315,15 @@ That is it. Train it, and the model that comes out is MyCoolModel, trained by yo
 | `generate.py` | Text generation from a checkpoint, CLI wrapper around inference.py, prompt enhancement |
 | `config.json` | Model config, HF format |
 | `requirements.txt` | Dependencies |
+| `parallel.py` | 3D parallelism: tensor + pipeline + data parallel, expert parallel, GPU plan |
+| `sft.py` | Supervised fine-tuning on instruction/response pairs |
+| `dpo.py` | Direct Preference Optimization on chosen/rejected pairs |
+| `validate_cluster.py` | Cluster pre-flight checks before a big run |
+| `LICENSE-WEIGHTS` | MNAI Weights License for trained weights and GGUF files |
 
 ## License
 
-MIT. Train it, use it, sell it. It is yours once you train it.
+Two licenses, on purpose. The code in this repo is MIT licensed — train it, use it, sell it, change it, the code is yours to do what you want with. The trained weights and GGUF files are under the MNAI Weights License (LICENSE-WEIGHTS): you may use them and share them unchanged, but you may not modify them and re-release them, and you may not re-release them under a different name. The weights are locked to the model they came from. Training your own model — pre-training, SFT, DPO — is how the weights are made, not a re-release. Rename the model to your own brand, and put the text `Your Brand x MNAI` on it, with your brand name in place of "Your Brand". That credit is the only thing you owe.
 
 ## FAQ
 
@@ -273,7 +346,7 @@ One 24GB GPU. Weights, grads, and 8-bit Adam states together are about 12GB, whi
 All of the internet. The full FineWeb crawl, 15 trillion tokens of open web text, plus FineWeb-Edu. A 2B model wants about 40B tokens, so you train on the best 40B of it.
 
 **Is MNAI Nyx 0.5 open source?**
-Yes. The code is MIT licensed and public on GitHub. The model is yours once you train it.
+Yes. The code is MIT licensed and public on GitHub. The trained weights are under the MNAI Weights License — free to use and share unchanged, locked against modification and re-release under another name. The model is yours once you train it.
 
 **How big is MNAI Nyx 0.5?**
 2.1 billion parameters. Core text is 2.0B (2560 hidden, 24 layers, 20 attention heads, 128256 token vocabulary, 8192 context), plus the any-to-any modules: vision encoder 0.031B, image decoder 0.091B, audio encoder and decoder 0.006B.
@@ -285,7 +358,7 @@ Yes. Text, image, and audio in, text, image, and audio out. One model reads and 
 Same family, same tech, different size. Nyx 0.5 is 2B and trains on one GPU. Nyx 1 is 504.5B and needs 128x H100 minimum. Nyx 1.2 is 2.21T and needs 512x H100 minimum. If you want to actually finish training a model yourself, start with 0.5.
 
 **Has the architecture been proven at scale?**
-The shape is the standard Llama block layout, the same one LLaMA and Mistral use, with GQA and SwiGLU. Before a full run, `scaling.py` trains three tiny models with the exact same layout, fits a power law to their losses, and predicts the loss at 2.1B. A clean falling trend is the evidence the shape converges. The full 2B run itself is what you do when you train it, and `train.py` has a loss spike guard that drops any step above 3x the running average and reloads the last checkpoint, so one bad batch cannot wreck the run.
+The shape is the standard Llama block layout, the same one LLaMA and Mistral use, with GQA and SwiGLU. Before a full run, `scaling.py` trains three tiny models with the exact same layout, fits a power law to their losses, and predicts the loss at 2.1B. A clean falling trend is the evidence the shape converges. One honest note: the proxy losses flatten at 2.32, 2.26, 2.26 — the 20M proxy barely beats the 5M one, because at 300 steps on a tiny corpus the bigger proxy is undertrained. The fit is an extrapolation, not a guarantee. What is proven is that the shape converges at small scale with a sane predicted loss; what is not proven is a full 2.1B cluster run, because nobody has run one yet. `validate_cluster.py` checks the cluster setup before you start one. The full 2B run itself is what you do when you train it, and `train.py` has a loss spike guard that drops any step above 3x the running average and reloads the last checkpoint, so one bad batch cannot wreck the run.
 
 **Does the repo include the data pipeline?**
 Yes. `data.py` is the pipeline: 15T tokens of FineWeb plus FineWeb-Edu streamed and tokenized on the fly, document filtering, exact dedup by hash, near-dup dedup by shingles, a domain-balanced mix (web 50%, books 15%, code 15%, academic 10%, synthetic 10%), and synthetic data generation in `synthetic.py`. The raw 15TB is not in the repo because no repo holds 15TB. The pipeline that fetches, cleans, dedups, and balances it is.
@@ -297,7 +370,16 @@ Both. Dense is the default: 2.0B, every token runs through every parameter. MoE 
 Yes, two. `quantize.py` turns a trained checkpoint into Q4_K_M (~1.1 GB) and Q8_0 (~2.0 GB) GGUFs with llama.cpp. The Q files are produced once someone trains the model; the script is ready now and works on any checkpoint, even a smoke checkpoint.
 
 **Is MNAI Nyx worth training?**
-Yes, and 0.5 is the one to start with. It is the only public repo that gives you a 2B any-to-any model, the full data pipeline for the entire internet, a scaling-law check, dense and MoE, and quantized outputs, all from scratch, all MIT licensed, and it trains on one GPU you probably already have. You bring the GPU, you train it, and the model that comes out is yours. MNAI Nyx family is a real legit AI, That YOU have to train.
+Yes, and 0.5 is the one to start with. It is the only public repo that gives you a 2B any-to-any model, the full data pipeline for the entire internet, a scaling-law check, dense and MoE, and quantized outputs, all from scratch, code MIT licensed and weights under the MNAI Weights License, and it trains on one GPU you probably already have. You bring the GPU, you train it, and the model that comes out is yours. MNAI Nyx family is a real legit AI, That YOU have to train.
+
+**Why not just use FSDP?**
+FSDP is the default and it is fine up to about 128 GPUs. Past 256 GPUs it all-reduces the full gradient set across nodes every step, and the network becomes the wall. `parallel.py` builds a 3D mesh — tensor parallel inside a node, pipeline parallel across layers, FSDP only inside the data parallel group — and `train.py --parallel-plan N` tells you which one to use for your GPU count. At 2B you will never need it — FSDP over 8 GPUs is already more than enough.
+
+**How do I turn the pre-trained model into a chat assistant?**
+Post-training, two steps. SFT first (`sft.py`, instruction/response pairs, loss only on the response), then DPO (`dpo.py`, chosen/rejected pairs, frozen reference model). The pipeline is pretrain -> SFT -> DPO (-> GRPO). A raw pre-trained checkpoint only autocompletes internet text.
+
+**What license are the weights under?**
+The MNAI Weights License (LICENSE-WEIGHTS). The code is MIT; the weights are not. You may use the weights and share them unchanged, but you may not modify them and re-release them, and you may not re-release them under a different name. Rename the model to your own brand and put `Your Brand x MNAI` on it. Training your own model — pre-training, SFT, DPO — is how the weights are made, not a re-release.
 
 ## Credits
 
